@@ -47,6 +47,8 @@ def parse_args():
                    help="Bind address and port, e.g. 127.0.0.1:8080 or 0.0.0.0:8443")
     p.add_argument("--health-path", default="/health",
                    help="Path for health endpoint (default: /health)")
+    p.add_argument("--client-host", type=str, default="127.0.0.1",
+                   help="Local IRC client host to test (TCP connect on 127.0.0.1)")
     p.add_argument("--client-port", type=int, default=6667,
                    help="Local IRC client port to test (TCP connect on 127.0.0.1)")
     p.add_argument("--s2s-ports", default=4497,
@@ -76,9 +78,9 @@ def parse_args():
 def now_iso() -> str:
     return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
 
-def can_connect_local(port: int, timeout_ms: int) -> Tuple[bool, Optional[str]]:
+def can_connect_local(host: str, port: int, timeout_ms: int) -> Tuple[bool, Optional[str]]:
     try:
-        with socket.create_connection(("127.0.0.1", port), timeout=timeout_ms / 1000.0):
+        with socket.create_connection((host, port), timeout=timeout_ms / 1000.0):
             return True, None
     except Exception as e:
         return False, str(e)
@@ -261,7 +263,8 @@ def count_established_s2s(ports: List[int],
     except Exception as e:
         return False, False, str(e)
 
-def compute_health(client_port: int,
+def compute_health(client_host: str,
+                   client_port: int,
                    s2s_ports: List[int],
                    timeout_ms: int,
                    stable_duration: int,
@@ -277,7 +280,7 @@ def compute_health(client_port: int,
         "warm": bool           # False during warmup period, True once connection is proven stable
     }
     """
-    client_ok, client_err = can_connect_local(client_port, timeout_ms)
+    client_ok, client_err = can_connect_local(client_host, client_port, timeout_ms)
     s2s_stable, s2s_warming, s2s_err = count_established_s2s(s2s_ports, stable_duration, connection_tracker)
 
     # During warmup, we're optimistic: s2s is "valid" if warming (has any connection)
@@ -321,6 +324,7 @@ class HealthHandler(BaseHTTPRequestHandler):
             result = self.server.last_result or {"clientValid": False, "s2sValid": False, "routable": False, "warm": False}
         else:
             result = compute_health(
+                self.server.client_host,
                 self.server.client_port,
                 self.server.s2s_ports,
                 self.server.timeout_ms,
@@ -360,6 +364,7 @@ class TLSReloadingServer:
                  bind_port: int,
                  handler_cls,
                  health_path: str,
+                 client_host: str,
                  client_port: int,
                  s2s_ports: List[int],
                  timeout_ms: int,
@@ -374,6 +379,7 @@ class TLSReloadingServer:
         self.bind_port = bind_port
         self.handler_cls = handler_cls
         self.health_path = health_path
+        self.client_host = client_host
         self.client_port = client_port
         self.s2s_ports = s2s_ports
         self.timeout_ms = timeout_ms
@@ -418,6 +424,7 @@ class TLSReloadingServer:
         httpd = ThreadingHTTPServer((self.bind_host, self.bind_port), self.handler_cls)
         # attach config to server for handler access
         httpd.health_path = self.health_path
+        httpd.client_host = self.client_host
         httpd.client_port = self.client_port
         httpd.s2s_ports = self.s2s_ports
         httpd.timeout_ms = self.timeout_ms
@@ -525,6 +532,7 @@ class TLSReloadingServer:
             while not self._stop_evt.wait(max(5, self.poll_interval)):
                 try:
                     self.last_result = compute_health(
+                        self.client_host,
                         self.client_port,
                         self.s2s_ports,
                         self.timeout_ms,
@@ -576,6 +584,7 @@ def main():
         bind_port=bind_port,
         handler_cls=HealthHandler,
         health_path=args.health_path if args.health_path.startswith("/") else "/" + args.health_path,
+        client_host=args.client_host,
         client_port=args.client_port,
         s2s_ports=s2s_ports or [7000],
         timeout_ms=max(50, args.timeout_ms),
